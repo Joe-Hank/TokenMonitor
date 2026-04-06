@@ -1,0 +1,17 @@
+{
+  "id": "20260407-001",
+  "name": "Claude-TokenMonitor",
+  "alias": "Claude Token 监控器",
+  "created": "2026-04-07",
+  "modified": "2026-04-07",
+  "version": "0.1.0",
+  "language": "Python",
+  "framework": "tkinter",
+  "entry": "src/monitor.py",
+  "run": "python src/monitor.py",
+  "status": "done",
+  "tags": ["工具", "监控", "Claude", "tkinter"],
+  "assets": [],
+  "git": true,
+  "repo": ""
+}
