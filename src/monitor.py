@@ -21,6 +21,9 @@ FIVE_HOUR_TOTAL = 20_000
 SEVEN_DAY_TOTAL = 1_000_000
 
 REFRESH_INTERVAL = 300  # 自动刷新间隔（秒）
+
+# 本地代理（如不使用代理请设为 None）
+PROXY = "http://127.0.0.1:7890"
 # ============================================================
 
 BG       = "#000000"
@@ -64,6 +67,7 @@ def parse_reset(iso_str: str) -> str:
 
 def fetch_data() -> dict:
     try:
+        proxy = {"https": PROXY, "http": PROXY} if PROXY else None
         resp = requests.get(
             f"https://claude.ai/api/organizations/{ORG_ID}/usage",
             headers={
@@ -81,6 +85,7 @@ def fetch_data() -> dict:
                 "ajs_anonymous_id":    ANON_ID,
             },
             impersonate="chrome124",
+            proxies=proxy,
             timeout=15,
         )
 
