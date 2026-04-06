@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Token Monitor
-监控 Claude API 账号的 Token 剩余量
+Claude Token Monitor — 基于 Claude.ai 会话的 Token 用量监控
 """
 import tkinter as tk
 import httpx
@@ -9,10 +8,21 @@ import threading
 from datetime import datetime, timezone
 
 # ============================================================
-#  配置区 — 填入你的 API Key
+#  配置区 — Cookie 过期时需从浏览器重新复制
 # ============================================================
-API_KEY          = "sk-ant-XXXXXXXXXXXXXXXX"   # ← 填入你的 Anthropic API Key
-REFRESH_INTERVAL = 300                          # 自动刷新间隔（秒），默认 5 分钟
+ORG_ID      = "c9c7cc79-dd59-458f-81c0-69e002b478b2"
+SESSION_KEY = "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"
+DEVICE_ID   = "cede9a57-c43e-4275-a7b4-c2fe1bf1e8d4"
+ANON_ID     = "claudeai.v1.c05d1e10-fed3-4ef4-ac36-130c29ae4124"
+
+# Cloudflare 防护 Token（约每天过期，过期后从浏览器 Cookie 重新复制 cf_clearance 的值）
+CF_CLEARANCE = "2t7.2HFu_OSBoXUhk6H4lO2SUapd.ZoyP7ln49giwLc-1775494226-1.2.1.1-KK2XnQftZsmfsZc3AKcSIyj2D5DfghrEbkVf.4gfV2T3wQthviU8w1wbtdyYp7vRSADQAh9BuL_PLSvu6GebU9241fED.URtlt_oo3a2bDFb3sgplhGv2iPkm8Vqc4eG2LtuicHw1nKaWoZ_veAl5wzatehf7RNAkdPBTbxgwjmahsZQ7WwWuMp9mLwe9fNmlxS5fI9lonLloSx5vFTreL4FIMiLlBTGWsE8SbhmGfGpwBlPnwu2SM9oyQuOZPMxQiEHwaagqLSteejlkgjqFo2.7DcjlIhD8cge6T1vFBvof1xqb0ot3FkVpuOxRqqORgj3mDSratLqIpYseQVW4Q"
+
+# Claude Max 套餐 Token 上限（如实际上限不同请修改）
+FIVE_HOUR_TOTAL = 20_000
+SEVEN_DAY_TOTAL = 1_000_000
+
+REFRESH_INTERVAL = 300  # 自动刷新间隔（秒）
 # ============================================================
 
 BG       = "#000000"
@@ -24,20 +34,18 @@ FONT     = "Microsoft YaHei"
 
 
 def token_color(remaining: int, total: int) -> str:
-    """根据剩余百分比返回数字颜色"""
     if total <= 0:
         return FG_WHITE
     pct = remaining / total * 100
     if pct >= 50:
-        return FG_WHITE    # 充足
+        return FG_WHITE
     elif pct >= 20:
-        return "#FFA040"   # 警告（橙）
+        return "#FFA040"
     else:
-        return "#FF4444"   # 危险（红）
+        return "#FF4444"
 
 
 def parse_reset(iso_str: str) -> str:
-    """ISO 时间字符串 → 中文友好显示"""
     if not iso_str:
         return "—"
     try:
@@ -57,53 +65,53 @@ def parse_reset(iso_str: str) -> str:
 
 
 def fetch_data() -> dict:
-    """向 Anthropic API 发送最小请求，从响应头读取 rate limit 数据"""
     try:
-        with httpx.Client(timeout=15) as c:
-            resp = c.post(
-                "https://api.anthropic.com/v1/messages",
+        cookie = (
+            f"anthropic-device-id={DEVICE_ID}; "
+            f"sessionKey={SESSION_KEY}; "
+            f"lastActiveOrg={ORG_ID}; "
+            f"ajs_anonymous_id={ANON_ID}; "
+            f"cf_clearance={CF_CLEARANCE}"
+        )
+
+        with httpx.Client(timeout=15, follow_redirects=True) as c:
+            resp = c.get(
+                f"https://claude.ai/api/organizations/{ORG_ID}/usage",
                 headers={
-                    "x-api-key": API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 1,
-                    "messages": [{"role": "user", "content": "1"}],
-                },
+                    "cookie":                    cookie,
+                    "anthropic-anonymous-id":    ANON_ID,
+                    "anthropic-client-platform": "web_claude_ai",
+                    "anthropic-client-version":  "1.0.0",
+                    "anthropic-device-id":       DEVICE_ID,
+                    "content-type":              "application/json",
+                    "referer":                   "https://claude.ai/settings/usage",
+                    "user-agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                    "sec-fetch-mode":            "cors",
+                    "sec-fetch-site":            "same-origin",
+                }
             )
 
-        h = resp.headers
+        if resp.status_code != 200:
+            return {"error": f"HTTP {resp.status_code}，Cookie 可能已过期，请重新复制"}
 
-        def get_int(key: str) -> int:
-            v = h.get(key, "").strip()
-            return int(v) if v.isdigit() else 0
+        data = resp.json()
 
-        # 收集所有可用的 token rate limit 窗口
-        windows = []
-        for prefix in (
-            "anthropic-ratelimit-tokens",
-            "anthropic-ratelimit-input-tokens",
-            "anthropic-ratelimit-output-tokens",
-        ):
-            limit     = get_int(f"{prefix}-limit")
-            remaining = get_int(f"{prefix}-remaining")
-            reset_raw = h.get(f"{prefix}-reset", "")
-            if limit > 0:
-                windows.append({
-                    "limit":     limit,
-                    "remaining": remaining,
-                    "reset_str": parse_reset(reset_raw),
-                })
+        def parse_block(block, total):
+            if not block:
+                return None
+            utilization = block.get("utilization", 0) or 0
+            remaining = max(0, int(total * (1 - utilization / 100)))
+            return {
+                "remaining": remaining,
+                "total":     total,
+                "reset_str": parse_reset(block.get("resets_at", "")),
+            }
 
-        if not windows:
-            return {"error": "未获取到 rate limit 信息，请检查 API Key 是否正确"}
+        hourly = parse_block(data.get("five_hour"), FIVE_HOUR_TOTAL)
+        weekly = parse_block(data.get("seven_day"), SEVEN_DAY_TOTAL)
 
-        # 按 limit 升序：最小窗口 = 时余量，最大窗口 = 周余量
-        windows.sort(key=lambda x: x["limit"])
-        hourly = windows[0]
-        weekly = windows[-1] if len(windows) > 1 else None
+        if not hourly:
+            return {"error": "未获取到用量数据"}
 
         return {"hourly": hourly, "weekly": weekly, "error": None}
 
@@ -112,7 +120,6 @@ def fetch_data() -> dict:
 
 
 class ProgressBar:
-    """用 Canvas 绘制的平面进度条"""
     H = 20
 
     def __init__(self, parent: tk.Widget, width: int):
@@ -127,18 +134,13 @@ class ProgressBar:
 
     def draw(self, remaining: int, total: int):
         self.canvas.delete("all")
-        # 背景轨道
-        self.canvas.create_rectangle(0, 0, self.width, self.H,
-                                      fill=BAR_BG, outline="")
-        # 剩余填充
+        self.canvas.create_rectangle(0, 0, self.width, self.H, fill=BAR_BG, outline="")
         if total > 0 and remaining > 0:
             fw = max(1, int(self.width * remaining / total))
-            self.canvas.create_rectangle(0, 0, fw, self.H,
-                                          fill=BAR_FG, outline="")
+            self.canvas.create_rectangle(0, 0, fw, self.H, fill=BAR_FG, outline="")
 
 
 class Section:
-    """一个展示区块（时余量 / 周余量）"""
     def __init__(self, parent: tk.Widget, title: str, bar_width: int):
         self.frame = tk.Frame(parent, bg=BG)
 
@@ -169,10 +171,7 @@ class Section:
     def update(self, remaining: int, total: int, reset_str: str):
         self.bar.draw(remaining, total)
         self.lbl_reset.config(text=f"重置时间: {reset_str}")
-        self.lbl_val.config(
-            text=f"{remaining:,}",
-            fg=token_color(remaining, total)
-        )
+        self.lbl_val.config(text=f"{remaining:,}", fg=token_color(remaining, total))
         self.lbl_tot.config(text=f"/{total:,}")
 
     def pack(self, **kw):
@@ -196,8 +195,8 @@ class App:
 
         self._countdown = REFRESH_INTERVAL
         self._build()
-        self._refresh()   # 启动时立即获取数据
-        self._tick()      # 启动倒计时
+        self._refresh()
+        self._tick()
 
     def _build(self):
         bar_w = self.W - self.PAD * 2
@@ -211,7 +210,6 @@ class App:
         self.spacer.pack()
 
         self.sec_weekly = Section(outer, "周余量", bar_w)
-        # 初始隐藏，有数据时再显示
         self.sec_weekly.pack_forget()
 
         self.lbl_status = tk.Label(
@@ -225,17 +223,19 @@ class App:
             self.lbl_status.config(text=f"错误：{data['error']}", fg="#FF6666")
             return
 
-        now_str = datetime.now().strftime("%H:%M:%S")
-        self.lbl_status.config(text=f"更新于 {now_str}", fg=FG_GRAY)
+        self.lbl_status.config(
+            text=f"更新于 {datetime.now().strftime('%H:%M:%S')}",
+            fg=FG_GRAY
+        )
 
         h = data["hourly"]
-        self.sec_hourly.update(h["remaining"], h["limit"], h["reset_str"])
+        self.sec_hourly.update(h["remaining"], h["total"], h["reset_str"])
 
         w = data.get("weekly")
         if w:
-            self.sec_weekly.pack(fill="x")
             self.spacer.pack()
-            self.sec_weekly.update(w["remaining"], w["limit"], w["reset_str"])
+            self.sec_weekly.pack(fill="x")
+            self.sec_weekly.update(w["remaining"], w["total"], w["reset_str"])
         else:
             self.spacer.pack_forget()
             self.sec_weekly.pack_forget()
