@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
 Claude Token Monitor — 基于 Claude.ai 会话的 Token 用量监控
+使用 curl_cffi 模拟浏览器 TLS 指纹，无需手动维护 cf_clearance
 """
 import tkinter as tk
-import httpx
 import threading
 from datetime import datetime, timezone
+from curl_cffi import requests
 
 # ============================================================
-#  配置区 — Cookie 过期时需从浏览器重新复制
+#  配置区 — 仅需维护 SESSION_KEY（长期有效，一般无需更换）
 # ============================================================
 ORG_ID      = "c9c7cc79-dd59-458f-81c0-69e002b478b2"
 SESSION_KEY = "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"
 DEVICE_ID   = "cede9a57-c43e-4275-a7b4-c2fe1bf1e8d4"
 ANON_ID     = "claudeai.v1.c05d1e10-fed3-4ef4-ac36-130c29ae4124"
-
-# Cloudflare 防护 Token（约每天过期，过期后从浏览器 Cookie 重新复制 cf_clearance 的值）
-CF_CLEARANCE = "2t7.2HFu_OSBoXUhk6H4lO2SUapd.ZoyP7ln49giwLc-1775494226-1.2.1.1-KK2XnQftZsmfsZc3AKcSIyj2D5DfghrEbkVf.4gfV2T3wQthviU8w1wbtdyYp7vRSADQAh9BuL_PLSvu6GebU9241fED.URtlt_oo3a2bDFb3sgplhGv2iPkm8Vqc4eG2LtuicHw1nKaWoZ_veAl5wzatehf7RNAkdPBTbxgwjmahsZQ7WwWuMp9mLwe9fNmlxS5fI9lonLloSx5vFTreL4FIMiLlBTGWsE8SbhmGfGpwBlPnwu2SM9oyQuOZPMxQiEHwaagqLSteejlkgjqFo2.7DcjlIhD8cge6T1vFBvof1xqb0ot3FkVpuOxRqqORgj3mDSratLqIpYseQVW4Q"
 
 # Claude Max 套餐 Token 上限（如实际上限不同请修改）
 FIVE_HOUR_TOTAL = 20_000
@@ -66,40 +64,37 @@ def parse_reset(iso_str: str) -> str:
 
 def fetch_data() -> dict:
     try:
-        cookie = (
-            f"anthropic-device-id={DEVICE_ID}; "
-            f"sessionKey={SESSION_KEY}; "
-            f"lastActiveOrg={ORG_ID}; "
-            f"ajs_anonymous_id={ANON_ID}; "
-            f"cf_clearance={CF_CLEARANCE}"
+        resp = requests.get(
+            f"https://claude.ai/api/organizations/{ORG_ID}/usage",
+            headers={
+                "anthropic-anonymous-id":    ANON_ID,
+                "anthropic-client-platform": "web_claude_ai",
+                "anthropic-client-version":  "1.0.0",
+                "anthropic-device-id":       DEVICE_ID,
+                "content-type":              "application/json",
+                "referer":                   "https://claude.ai/settings/usage",
+            },
+            cookies={
+                "sessionKey":          SESSION_KEY,
+                "anthropic-device-id": DEVICE_ID,
+                "lastActiveOrg":       ORG_ID,
+                "ajs_anonymous_id":    ANON_ID,
+            },
+            impersonate="chrome124",
+            timeout=15,
         )
 
-        with httpx.Client(timeout=15, follow_redirects=True) as c:
-            resp = c.get(
-                f"https://claude.ai/api/organizations/{ORG_ID}/usage",
-                headers={
-                    "cookie":                    cookie,
-                    "anthropic-anonymous-id":    ANON_ID,
-                    "anthropic-client-platform": "web_claude_ai",
-                    "anthropic-client-version":  "1.0.0",
-                    "anthropic-device-id":       DEVICE_ID,
-                    "content-type":              "application/json",
-                    "referer":                   "https://claude.ai/settings/usage",
-                    "user-agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-                    "sec-fetch-mode":            "cors",
-                    "sec-fetch-site":            "same-origin",
-                }
-            )
-
+        if resp.status_code == 403:
+            return {"error": "Session 已过期，请更新 SESSION_KEY"}
         if resp.status_code != 200:
-            return {"error": f"HTTP {resp.status_code}，Cookie 可能已过期，请重新复制"}
+            return {"error": f"HTTP {resp.status_code}"}
 
         data = resp.json()
 
         def parse_block(block, total):
             if not block:
                 return None
-            utilization = block.get("utilization", 0) or 0
+            utilization = block.get("utilization") or 0
             remaining = max(0, int(total * (1 - utilization / 100)))
             return {
                 "remaining": remaining,
