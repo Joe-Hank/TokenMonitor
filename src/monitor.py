@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Claude Token Monitor — 基于 Claude.ai 会话的 Token 用量监控
+Claude Token Monitor — 低代码极简版
 """
+import time
 import tkinter as tk
 import threading
+import traceback
 from datetime import datetime, timezone
 from curl_cffi import requests
 
@@ -16,31 +18,30 @@ DEVICE_ID   = "cede9a57-c43e-4275-a7b4-c2fe1bf1e8d4"
 ANON_ID     = "claudeai.v1.c05d1e10-fed3-4ef4-ac36-130c29ae4124"
 
 REFRESH_INTERVAL = 20                       # 自动刷新间隔（秒）
+MIN_REFRESH_GAP  = 10                       # 两次刷新之间最小间隔（秒），防忙轮询
+BACKOFF_STEPS    = [5, 10, 30, 60, 120]     # 失败指数退避（秒）
 PROXY            = "http://127.0.0.1:7890"  # 不使用代理则设为 None
 # ============================================================
 
-BG       = "#000000"
-FG_WHITE = "#FFFFFF"
-FG_GRAY  = "#888888"
-BAR_FG   = "#DDDDDD"
-BAR_BG   = "#2A2A2A"
-FONT     = "Microsoft YaHei"
+BG    = "#000000"
+FG    = "#AAAAAA"
+DIM   = "#777777"
+FONT  = "Microsoft YaHei"
+FSIZE = 9
+ALPHA = 0.85
 
 
 def color_for(pct: float) -> str:
-    """剩余百分比 → 字色"""
     if pct >= 50:
-        return FG_WHITE
+        return FG
     elif pct >= 20:
-        return "#FFA040"
-    else:
-        return "#FF4444"
+        return "#AA8844"
+    return "#AA4444"
 
 
 def parse_reset(iso_str: str) -> str:
-    """ISO 时间 → 中文友好显示"""
     if not iso_str:
-        return "—"
+        return "--"
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
@@ -60,7 +61,6 @@ def parse_reset(iso_str: str) -> str:
 
 
 def reset_passed(iso_str: str) -> bool:
-    """重置时间是否已到"""
     if not iso_str:
         return False
     try:
@@ -71,7 +71,6 @@ def reset_passed(iso_str: str) -> bool:
 
 
 def fetch_data() -> dict:
-    """请求 Claude.ai usage 接口，返回剩余百分比"""
     try:
         proxy = {"https": PROXY, "http": PROXY} if PROXY else None
         resp = requests.get(
@@ -94,9 +93,8 @@ def fetch_data() -> dict:
             proxies=proxy,
             timeout=15,
         )
-
         if resp.status_code == 403:
-            return {"error": "Session 已过期，请更新 SESSION_KEY"}
+            return {"error": "Session 已过期"}
         if resp.status_code != 200:
             return {"error": f"HTTP {resp.status_code}"}
 
@@ -120,176 +118,188 @@ def fetch_data() -> dict:
         return {"error": str(e)}
 
 
-# ─── 视图组件 ──────────────────────────────────────────────
-class ProgressBar:
-    H = 20
-
-    def __init__(self, parent: tk.Widget, width: int):
-        self.width = width
-        self.canvas = tk.Canvas(parent, width=width, height=self.H,
-                                 bg=BG, highlightthickness=0)
-
-    def pack(self, **kw):
-        self.canvas.pack(**kw)
-
-    def draw(self, pct: float):
-        self.canvas.delete("all")
-        self.canvas.create_rectangle(0, 0, self.width, self.H,
-                                      fill=BAR_BG, outline="")
-        if pct > 0:
-            fw = max(1, int(self.width * pct / 100))
-            self.canvas.create_rectangle(0, 0, fw, self.H,
-                                          fill=BAR_FG, outline="")
-
-
-class Section:
-    def __init__(self, parent: tk.Widget, title: str, bar_width: int):
-        self.frame = tk.Frame(parent, bg=BG)
-        self._reset_iso = ""
-
-        tk.Label(self.frame, text=title, bg=BG, fg=FG_WHITE,
-                 font=(FONT, 13, "bold")).pack(anchor="w")
-
-        self.bar = ProgressBar(self.frame, bar_width)
-        self.bar.pack(fill="x", pady=(6, 4))
-
-        row = tk.Frame(self.frame, bg=BG)
-        row.pack(fill="x")
-
-        self.lbl_reset = tk.Label(row, text="重置时间: —", bg=BG, fg=FG_GRAY,
-                                   font=(FONT, 10))
-        self.lbl_reset.pack(side="left")
-
-        frm_num = tk.Frame(row, bg=BG)
-        frm_num.pack(side="right")
-
-        self.lbl_val = tk.Label(frm_num, text="—", bg=BG, fg=FG_WHITE,
-                                 font=(FONT, 26, "bold"))
-        self.lbl_val.pack(side="left", anchor="s")
-
-        self.lbl_unit = tk.Label(frm_num, text="%", bg=BG, fg=FG_WHITE,
-                                  font=(FONT, 14))
-        self.lbl_unit.pack(side="left", anchor="s", pady=(0, 3))
-
-    def update(self, remaining_pct: float, reset_iso: str):
-        self._reset_iso = reset_iso
-        self.bar.draw(remaining_pct)
-        self.lbl_val.config(text=f"{int(round(remaining_pct))}",
-                             fg=color_for(remaining_pct))
-        self.refresh_reset_label()
-
-    def refresh_reset_label(self):
-        self.lbl_reset.config(text=f"重置时间: {parse_reset(self._reset_iso)}")
-
-    def is_expired(self) -> bool:
-        return bool(self._reset_iso) and reset_passed(self._reset_iso)
-
-    def pack(self, **kw):
-        self.frame.pack(**kw)
-
-    def pack_forget(self):
-        self.frame.pack_forget()
-
-
-# ─── 主应用 ───────────────────────────────────────────────
 class App:
-    PAD = 40
-    W   = 600
-    H   = 330
+    W = 220
+    H = 72
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Claude Token Monitor")
+        root.title("Token Monitor")
         root.configure(bg=BG)
         root.resizable(False, False)
         root.geometry(f"{self.W}x{self.H}")
+        root.attributes("-topmost", True)
+        root.attributes("-alpha", ALPHA)
+        root.overrideredirect(True)
 
-        self._countdown      = REFRESH_INTERVAL
-        self._refreshing     = False
-        self._weekly_visible = False
+        self._topmost = True
+        self._countdown = REFRESH_INTERVAL
+        self._refreshing = False
+        self._hourly_iso = ""
+        self._weekly_iso = ""
+        self._weekly_pct = None
+        self._drag_x = 0
+        self._drag_y = 0
+        self._fail_count = 0
+        self._last_refresh_ts = 0.0
 
         self._build()
         self._refresh()
         self._tick()
 
     def _build(self):
-        bar_w = self.W - self.PAD * 2
-        outer = tk.Frame(self.root, bg=BG)
-        outer.pack(fill="both", expand=True, padx=self.PAD, pady=(self.PAD, 0))
+        # 顶栏
+        top = tk.Frame(self.root, bg="#000000", height=20)
+        top.pack(fill="x")
+        top.pack_propagate(False)
 
-        self.sec_hourly = Section(outer, "时余量", bar_w)
-        self.sec_hourly.pack(fill="x")
+        top.bind("<Button-1>", self._start_drag)
+        top.bind("<B1-Motion>", self._do_drag)
 
-        self.spacer = tk.Frame(outer, bg=BG, height=18)
-        self.spacer.pack()
+        self.lbl_status = tk.Label(
+            top, text="...", bg="#000000", fg=DIM, font=(FONT, FSIZE),
+        )
+        self.lbl_status.pack(side="left", padx=(6, 0))
 
-        self.sec_weekly = Section(outer, "周余量", bar_w)
-        self.sec_weekly.pack_forget()
+        self.btn_pin = tk.Label(
+            top, text="◆", bg="#000000", fg=DIM,
+            font=(FONT, FSIZE), cursor="hand2",
+        )
+        self.btn_pin.pack(side="right", padx=(0, 4))
+        self.btn_pin.bind("<Button-1>", self._toggle_topmost)
 
-        self.lbl_status = tk.Label(self.root, text="正在获取数据…", bg=BG, fg=FG_GRAY,
-                                    font=(FONT, 8))
-        self.lbl_status.pack(side="bottom", pady=(0, 10))
+        btn_close = tk.Label(
+            top, text="×", bg="#000000", fg=DIM,
+            font=(FONT, FSIZE), cursor="hand2",
+        )
+        btn_close.pack(side="right", padx=(0, 2))
+        btn_close.bind("<Button-1>", lambda _: self.root.destroy())
+
+        # 主体
+        body = tk.Frame(self.root, bg=BG)
+        body.pack(fill="both", expand=True, padx=8, pady=(2, 6))
+
+        # 时余量
+        r1 = tk.Frame(body, bg=BG)
+        r1.pack(fill="x", pady=(2, 0))
+        tk.Label(r1, text="时", bg=BG, fg=DIM, font=(FONT, FSIZE)).pack(side="left")
+        self.lbl_hourly = tk.Label(r1, text="--%", bg=BG, fg=FG, font=(FONT, FSIZE))
+        self.lbl_hourly.pack(side="left", padx=(4, 0))
+        self.lbl_hourly_reset = tk.Label(r1, text="--", bg=BG, fg=DIM, font=(FONT, FSIZE), anchor="e")
+        self.lbl_hourly_reset.pack(side="right")
+
+        # 周余量
+        r2 = tk.Frame(body, bg=BG)
+        r2.pack(fill="x", pady=(2, 0))
+        tk.Label(r2, text="周", bg=BG, fg=DIM, font=(FONT, FSIZE)).pack(side="left")
+        self.lbl_weekly = tk.Label(r2, text="--%", bg=BG, fg=FG, font=(FONT, FSIZE))
+        self.lbl_weekly.pack(side="left", padx=(4, 0))
+        self.lbl_weekly_reset = tk.Label(r2, text="--", bg=BG, fg=DIM, font=(FONT, FSIZE), anchor="e")
+        self.lbl_weekly_reset.pack(side="right")
+
+    def _start_drag(self, event):
+        self._drag_x = event.x
+        self._drag_y = event.y
+
+    def _do_drag(self, event):
+        x = self.root.winfo_x() + event.x - self._drag_x
+        y = self.root.winfo_y() + event.y - self._drag_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def _toggle_topmost(self, _event=None):
+        self._topmost = not self._topmost
+        self.root.attributes("-topmost", self._topmost)
+        self.btn_pin.config(fg=DIM if self._topmost else "#444444")
 
     def _on_data(self, data: dict):
-        self._refreshing = False
+        try:
+            if data.get("error"):
+                self._fail_count += 1
+                msg = data["error"]
+                if len(msg) > 24:
+                    msg = msg[:24] + "…"
+                self.lbl_status.config(text=msg, fg="#AA4444")
+                return
 
-        if data.get("error"):
-            self.lbl_status.config(text=f"错误：{data['error']}", fg="#FF6666")
-            return
+            self._fail_count = 0
+            self.lbl_status.config(
+                text=datetime.now().strftime("%H:%M:%S"), fg=DIM,
+            )
+            self._apply_data(data)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self._refreshing = False
 
-        self.lbl_status.config(
-            text=f"更新于 {datetime.now().strftime('%H:%M:%S')}",
-            fg=FG_GRAY,
-        )
-
+    def _apply_data(self, data: dict):
         h = data.get("hourly")
         if h:
-            self.sec_hourly.update(h["remaining_pct"], h["reset_iso"])
+            pct = h["remaining_pct"]
+            self._hourly_iso = h["reset_iso"]
+            self.lbl_hourly.config(text=f"{int(round(pct))}%", fg=color_for(pct))
+            self.lbl_hourly_reset.config(text=parse_reset(self._hourly_iso))
 
         w = data.get("weekly")
         if w:
-            if not self._weekly_visible:
-                self.spacer.pack()
-                self.sec_weekly.pack(fill="x")
-                self._weekly_visible = True
-            self.sec_weekly.update(w["remaining_pct"], w["reset_iso"])
+            pct = w["remaining_pct"]
+            self._weekly_pct = pct
+            self._weekly_iso = w["reset_iso"]
+            self.lbl_weekly.config(text=f"{int(round(pct))}%", fg=color_for(pct))
+            self.lbl_weekly_reset.config(text=parse_reset(self._weekly_iso))
         else:
-            if self._weekly_visible:
-                self.spacer.pack_forget()
-                self.sec_weekly.pack_forget()
-                self._weekly_visible = False
+            self._weekly_pct = None
+            self.lbl_weekly.config(text="N/A", fg=DIM)
+            self.lbl_weekly_reset.config(text="")
 
-    def _refresh(self):
+    def _refresh(self, force: bool = False):
         if self._refreshing:
             return
+        now = time.monotonic()
+        if not force and (now - self._last_refresh_ts) < MIN_REFRESH_GAP:
+            return
         self._refreshing = True
+        self._last_refresh_ts = now
         self._countdown = REFRESH_INTERVAL
 
         def worker():
-            result = fetch_data()
-            self.root.after(0, lambda: self._on_data(result))
+            try:
+                result = fetch_data()
+            except Exception as e:
+                result = {"error": f"worker: {e}"}
+            try:
+                self.root.after(0, lambda: self._on_data(result))
+            except Exception:
+                # Tk 已销毁等情况，确保状态不卡死
+                self._refreshing = False
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _current_interval(self) -> int:
+        if self._fail_count <= 0:
+            return REFRESH_INTERVAL
+        idx = min(self._fail_count - 1, len(BACKOFF_STEPS) - 1)
+        return BACKOFF_STEPS[idx]
+
     def _tick(self):
-        # 每秒刷新重置时间倒计时显示
-        self.sec_hourly.refresh_reset_label()
-        if self._weekly_visible:
-            self.sec_weekly.refresh_reset_label()
+        try:
+            self.lbl_hourly_reset.config(text=parse_reset(self._hourly_iso))
+            if self._weekly_pct is not None:
+                self.lbl_weekly_reset.config(text=parse_reset(self._weekly_iso))
 
-        # 重置时间已到 → 立即拉取新数据
-        expired = self.sec_hourly.is_expired() or (
-            self._weekly_visible and self.sec_weekly.is_expired()
-        )
+            expired = reset_passed(self._hourly_iso) or (
+                self._weekly_pct is not None and reset_passed(self._weekly_iso)
+            )
+            if expired:
+                self._refresh()  # 受 MIN_REFRESH_GAP 保护，不会忙轮询
 
-        if expired:
-            self._refresh()
-        else:
             self._countdown -= 1
             if self._countdown <= 0:
+                self._countdown = self._current_interval()
                 self._refresh()
-
-        self.root.after(1000, self._tick)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.root.after(1000, self._tick)
 
 
 if __name__ == "__main__":
